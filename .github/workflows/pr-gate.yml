@@ -550,6 +550,180 @@ jobs:
 
 
 # ─────────────────────────────────────────────
+# SpotBugs + Find Security Bugs — Java-only, bytecode-level static analysis.
+# Distinct from semgrep: SpotBugs analyzes compiled .class files, not source
+# text, so it follows dataflow across method calls (e.g. tainted user input
+# reaching a JDBC query several calls later) that syntactic pattern matching
+# generally misses. find-sec-bugs adds ~140 security-specific bug patterns
+# (SQL/LDAP/XPath injection, XXE, SSRF, weak crypto, Spring/JPA-specific
+# issues) on top of SpotBugs' own general correctness checks (null derefs,
+# resource leaks, bad equals/hashCode) -- neither of which anything else in
+# this gate currently covers for Java.
+#
+# find-sec-bugs is downloaded directly (pinned version) and passed via
+# -Dspotbugs.pluginList, so this works on any caller's pom.xml without
+# requiring spotbugs-maven-plugin to be declared there -- the same ad-hoc
+# plugin-goal approach verify-maven-signatures uses for pgpverify.
+# Advisory only: the "spotbugs" goal (not "check") never fails the build on
+# findings, exit code is still captured defensively, and the PR comment
+# explicitly calls out that this never blocks the PR.
+# ─────────────────────────────────────────────
+  spotbugs-security:
+    name: SpotBugs + Find Security Bugs
+    needs: detect
+    if: ${{ needs.detect.outputs.has_java == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - uses: actions/setup-java@ad2b38190b15e4d6bdf0c97fb4fca8412226d287  # v5.3.0
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.JAVA_VERSION }}
+
+      - name: Cache Maven repository
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8  # v6.0.0
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-spotbugs-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-maven-
+
+      - name: Create Maven settings
+        run: |
+          cat > $GITHUB_WORKSPACE/settings.xml <<'EOF'
+          <settings>
+            <servers>
+              <server>
+                <id>ossrh</id>
+                <username>${{ secrets.OSSRH_USER }}</username>
+                <password>${{ secrets.OSSRH_SECRET }}</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
+
+      - name: Download find-sec-bugs plugin
+        run: |
+          curl -sSL --fail -o "$GITHUB_WORKSPACE/findsecbugs-plugin.jar" \
+            "https://repo1.maven.org/maven2/com/h3xstream/findsecbugs/findsecbugs-plugin/1.14.0/findsecbugs-plugin-1.14.0.jar"
+
+      - name: Compile (SpotBugs analyzes bytecode, not source)
+        run: |
+          cd "${{ needs.detect.outputs.java_location }}"
+          mvn -U -B compile -Dgpg.skip=true -Dmaven.wagon.http.retryHandler.count=2 \
+            --file pom.xml -s "$GITHUB_WORKSPACE/settings.xml"
+
+      - name: Run SpotBugs + Find Security Bugs (non-blocking)
+        id: spotbugs
+        run: |
+          cd "${{ needs.detect.outputs.java_location }}"
+          set +e
+          mvn -B com.github.spotbugs:spotbugs-maven-plugin:4.10.4.1:spotbugs \
+            -Dspotbugs.pluginList="$GITHUB_WORKSPACE/findsecbugs-plugin.jar" \
+            -Dspotbugs.sarifOutput=true \
+            --file pom.xml -s "$GITHUB_WORKSPACE/settings.xml"
+          code=$?
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "SpotBugs finished with exit code $code (non-blocking)."
+
+      - name: Collect SARIF reports from every module
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/spotbugs-sarif"
+          find "${{ needs.detect.outputs.java_location }}" -name 'spotbugsSarif.json' -print0 | \
+            while IFS= read -r -d '' f; do
+              safe=$(echo "$f" | tr -c 'a-zA-Z0-9._-' '_')
+              cp "$f" "$GITHUB_WORKSPACE/spotbugs-sarif/${safe}.sarif"
+            done
+          echo "Collected $(ls "$GITHUB_WORKSPACE/spotbugs-sarif" 2>/dev/null | wc -l) SARIF file(s)."
+
+      - name: Upload SARIF to Security tab
+        uses: github/codeql-action/upload-sarif@4e828ff8d448a8a6e532957b1811f387a63867e8  # v3.29.4
+        if: always()
+        with:
+          sarif_file: spotbugs-sarif
+          category: spotbugs-findsecbugs
+
+      # Builds a per-finding table with a direct link to find-sec-bugs' own
+      # pattern-detail page (bugs.htm#<RULE_ID>) so every row has concrete fix
+      # guidance, not just a bare pattern name.
+      - name: Build PR comment with fix guidance
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import json, glob, os
+
+          findings = []
+          sarif_dir = os.path.join(os.environ["GITHUB_WORKSPACE"], "spotbugs-sarif")
+          for path in glob.glob(os.path.join(sarif_dir, "*.sarif")):
+              try:
+                  with open(path, encoding="utf-8") as fh:
+                      sarif = json.load(fh)
+              except (json.JSONDecodeError, OSError):
+                  continue
+              for run in sarif.get("runs", []):
+                  rules = {r["id"]: r for r in run.get("tool", {}).get("driver", {}).get("rules", [])}
+                  for result in run.get("results", []):
+                      rule_id = result.get("ruleId", "UNKNOWN")
+                      rule = rules.get(rule_id, {})
+                      message = result.get("message", {}).get("text", "").strip().replace("|", "\\|")
+                      loc = (result.get("locations") or [{}])[0].get("physicalLocation", {})
+                      uri = loc.get("artifactLocation", {}).get("uri", "?")
+                      line = loc.get("region", {}).get("startLine", "?")
+                      severity = result.get("level", "warning")
+                      short_desc = rule.get("shortDescription", {}).get("text", rule_id)
+                      findings.append({
+                          "rule_id": rule_id,
+                          "short_desc": short_desc,
+                          "message": message,
+                          "uri": uri,
+                          "line": line,
+                          "severity": severity,
+                      })
+
+          out = os.path.join(os.environ["GITHUB_WORKSPACE"], "spotbugs-comment.md")
+          with open(out, "w", encoding="utf-8") as f:
+              f.write("## SpotBugs + Find Security Bugs\n\n")
+              if not findings:
+                  f.write("No SpotBugs / Find Security Bugs findings.\n")
+              else:
+                  f.write(
+                      "> **%d finding(s).** This check is **non-blocking** and will not fail "
+                      "the PR, but please review the items below.\n\n" % len(findings)
+                  )
+                  f.write("| Severity | File:Line | Bug Pattern | Message | How to fix |\n")
+                  f.write("|---|---|---|---|---|\n")
+                  for item in findings:
+                      fix_link = "https://find-sec-bugs.github.io/bugs.htm#" + item["rule_id"]
+                      f.write(
+                          "| %s | `%s:%s` | `%s` (%s) | %s | [Fix guidance](%s) |\n"
+                          % (item["severity"], item["uri"], item["line"], item["rule_id"],
+                             item["short_desc"], item["message"], fix_link)
+                      )
+                  f.write(
+                      "\n<sub>Full SARIF detail is also available under the repo's Security tab "
+                      "(category `spotbugs-findsecbugs`).</sub>\n"
+                  )
+          print("Wrote comment with %d finding(s)." % len(findings))
+          PYEOF
+
+      - name: Post SpotBugs findings comment
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
+        uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0  # v3.0.4
+        with:
+          header: spotbugs
+          path: spotbugs-comment.md
+
+
+# ─────────────────────────────────────────────
 # TIER 2 — Coverage (conditional on detect output, all parallel)
 # ─────────────────────────────────────────────
   coverage-java:
