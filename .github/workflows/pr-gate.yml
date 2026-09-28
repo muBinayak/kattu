@@ -640,10 +640,14 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/spotbugs-sarif"
           find "${{ needs.detect.outputs.java_location }}" -name 'spotbugsSarif.json' -print0 | \
             while IFS= read -r -d '' f; do
-              safe=$(echo "$f" | tr -c 'a-zA-Z0-9._-' '_')
+              # Prefix with a letter: java_location often starts with "./", and
+              # tr keeps "." as a literal character, so an unprefixed name can
+              # start with a dot and become a hidden file -- invisible to plain
+              # `ls` and to Python's glob.glob("*.sarif") in the next step.
+              safe="report_$(echo "$f" | tr -c 'a-zA-Z0-9._-' '_')"
               cp "$f" "$GITHUB_WORKSPACE/spotbugs-sarif/${safe}.sarif"
             done
-          echo "Collected $(ls "$GITHUB_WORKSPACE/spotbugs-sarif" 2>/dev/null | wc -l) SARIF file(s)."
+          echo "Collected $(find "$GITHUB_WORKSPACE/spotbugs-sarif" -maxdepth 1 -name '*.sarif' 2>/dev/null | wc -l) SARIF file(s)."
 
       - name: Upload SARIF to Security tab
         uses: github/codeql-action/upload-sarif@4e828ff8d448a8a6e532957b1811f387a63867e8  # v3.29.4
