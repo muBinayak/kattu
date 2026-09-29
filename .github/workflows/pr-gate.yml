@@ -482,7 +482,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
-      pull-requests: write   # reviewdog inline PR review comments
+      checks: write          # reviewdog PR annotations (github-pr-check reporter)
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
@@ -517,7 +517,7 @@ jobs:
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          reviewdog -f=sarif -name="trivy-config" -reporter=github-pr-review \
+          reviewdog -f=sarif -name="trivy-config" -reporter=github-pr-check \
             -filter-mode=added -fail-level=none < trivy-config.sarif
 
   semgrep:
@@ -526,7 +526,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
-      pull-requests: write   # reviewdog inline PR review comments
+      checks: write          # reviewdog PR annotations (github-pr-check reporter)
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
@@ -570,7 +570,7 @@ jobs:
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          reviewdog -f=sarif -name="semgrep" -reporter=github-pr-review \
+          reviewdog -f=sarif -name="semgrep" -reporter=github-pr-check \
             -filter-mode=added -fail-level=none < semgrep.sarif
 
 # ─────────────────────────────────────────────
@@ -598,7 +598,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
-      pull-requests: write   # reviewdog inline PR review comments
+      checks: write          # reviewdog PR annotations (github-pr-check reporter)
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
@@ -649,7 +649,7 @@ jobs:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           reviewdog -f=sarif -name="trivy-image-${{ steps.safe.outputs.name }}" \
-            -reporter=github-pr-review -filter-mode=nofilter -fail-level=none < trivy-image.sarif
+            -reporter=github-pr-check -filter-mode=nofilter -fail-level=none < trivy-image.sarif
 
   android-lint:
     name: Android Lint (security-relevant checks)
