@@ -91,23 +91,71 @@ jobs:
     name: Detect Stacks
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write   # commits the stack-detection cache file on push
     outputs:
-      has_java:         ${{ steps.detect.outputs.has_java }}
-      has_go:           ${{ steps.detect.outputs.has_go }}
-      has_npm:          ${{ steps.detect.outputs.has_npm }}
-      has_android:      ${{ steps.detect.outputs.has_android }}
-      has_flutter:      ${{ steps.detect.outputs.has_flutter }}
-      java_location:    ${{ steps.detect.outputs.java_location }}
-      go_location:      ${{ steps.detect.outputs.go_location }}
-      npm_location:     ${{ steps.detect.outputs.npm_location }}
-      android_location: ${{ steps.detect.outputs.android_location }}
-      flutter_location: ${{ steps.detect.outputs.flutter_location }}
+      has_java:         ${{ steps.detect.outputs.has_java || steps.cached.outputs.has_java }}
+      has_go:           ${{ steps.detect.outputs.has_go || steps.cached.outputs.has_go }}
+      has_npm:          ${{ steps.detect.outputs.has_npm || steps.cached.outputs.has_npm }}
+      has_android:      ${{ steps.detect.outputs.has_android || steps.cached.outputs.has_android }}
+      has_flutter:      ${{ steps.detect.outputs.has_flutter || steps.cached.outputs.has_flutter }}
+      java_location:    ${{ steps.detect.outputs.java_location || steps.cached.outputs.java_location }}
+      go_location:      ${{ steps.detect.outputs.go_location || steps.cached.outputs.go_location }}
+      npm_location:     ${{ steps.detect.outputs.npm_location || steps.cached.outputs.npm_location }}
+      android_location: ${{ steps.detect.outputs.android_location || steps.cached.outputs.android_location }}
+      flutter_location: ${{ steps.detect.outputs.flutter_location || steps.cached.outputs.flutter_location }}
+      images:           ${{ steps.discover.outputs.images || steps.cached.outputs.images }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: audit
 
-      - name: Detect stacks
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 0
+
+      # On a PR, reuse the detection cache committed by the last push to the
+      # base branch instead of recomputing from scratch on every PR (stack
+      # detection + Dockerfile discovery used to be separate jobs re-run on
+      # every PR; now they only run live on push, and a PR reads the cache).
+      # Falls back to live detection if the cache doesn't exist yet, or if
+      # this PR's own diff touches a stack-marker file or Dockerfile -- a PR
+      # that introduces a new stack must still be scanned for it immediately,
+      # not only after it merges and the cache next updates.
+      - name: Decide whether to use the cached detection
+        id: mode
+        run: |
+          USE_CACHE=false
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_REF="${{ github.event.pull_request.base.ref }}"
+            git fetch --depth=100 origin "$BASE_REF" 2>/dev/null || true
+            if git show "origin/$BASE_REF:.pr-gate-cache.json" > /tmp/pr-gate-cache.json 2>/dev/null; then
+              CHANGED="$(git diff --name-only "origin/$BASE_REF"...HEAD 2>/dev/null || echo "")"
+              if ! echo "$CHANGED" | grep -qE '(^|/)(pom\.xml|go\.mod|package\.json|settings\.gradle(\.kts)?|pubspec\.yaml|Dockerfile(\.[A-Za-z0-9_-]+)?)$'; then
+                USE_CACHE=true
+              fi
+            fi
+          fi
+          echo "use_cache=$USE_CACHE" >> "$GITHUB_OUTPUT"
+
+      - name: Read cached detection
+        id: cached
+        if: steps.mode.outputs.use_cache == 'true'
+        run: |
+          python3 -c "
+          import json, os
+          d = json.load(open('/tmp/pr-gate-cache.json'))
+          det = d.get('detect', {})
+          images = d.get('images', [])
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              for k, v in det.items():
+                  f.write(f'{k}={v}\n')
+              f.write('images=' + json.dumps(images) + '\n')
+          "
+          echo "Using cached detection from origin/${{ github.event.pull_request.base.ref }}."
+
+      - name: Detect stacks (live)
         id: detect
+        if: steps.mode.outputs.use_cache != 'true'
         run: |
           # Resolve each stack location: use the type-specific input when set,
           # otherwise fall back to SERVICE_LOCATION. Single-stack callers only
@@ -138,13 +186,84 @@ jobs:
           echo "android_location=$ANDROID_LOC" >> $GITHUB_OUTPUT
           echo "flutter_location=$FLUTTER_LOC" >> $GITHUB_OUTPUT
 
+      - name: Discover Dockerfile base images (live)
+        id: discover
+        if: steps.mode.outputs.use_cache != 'true'
+        run: |
+          python3 - <<'PYEOF'
+          import re, os, json
+
+          stage_pattern = re.compile(r'^\s*FROM\s+(\S+)(?:\s+[Aa][Ss]\s+(\S+))?', re.IGNORECASE)
+          base_images = set()
+          for root, dirs, files in os.walk('.'):
+              dirs[:] = [d for d in dirs if d not in ('.git', 'node_modules', 'vendor')]
+              for f in files:
+                  if f == 'Dockerfile' or f.startswith('Dockerfile.'):
+                      aliases = set()
+                      path = os.path.join(root, f)
+                      with open(path, encoding='utf-8', errors='ignore') as fh:
+                          for line in fh:
+                              m = stage_pattern.match(line)
+                              if not m:
+                                  continue
+                              image, alias = m.group(1), m.group(2)
+                              # Skip references to a previously-defined build
+                              # stage alias (not a real pullable image) and
+                              # FROM scratch (not a real image either).
+                              if image.lower() not in aliases and image.lower() != 'scratch':
+                                  base_images.add(image)
+                              if alias:
+                                  aliases.add(alias.lower())
+
+          images = sorted(base_images)
+          print("Discovered base images:", images)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as gh_out:
+              gh_out.write(f"images={json.dumps(images)}\n")
+          PYEOF
+
       - name: Print detected stacks
         run: |
-          echo "Java:    ${{ steps.detect.outputs.has_java }}  (${{ steps.detect.outputs.java_location }})"
-          echo "Go:      ${{ steps.detect.outputs.has_go }}  (${{ steps.detect.outputs.go_location }})"
-          echo "npm:     ${{ steps.detect.outputs.has_npm }}  (${{ steps.detect.outputs.npm_location }})"
-          echo "Android: ${{ steps.detect.outputs.has_android }}  (${{ steps.detect.outputs.android_location }})"
-          echo "Flutter: ${{ steps.detect.outputs.has_flutter }}  (${{ steps.detect.outputs.flutter_location }})"
+          echo "Mode:    $([ '${{ steps.mode.outputs.use_cache }}' = 'true' ] && echo cached || echo live)"
+          echo "Java:    ${{ steps.detect.outputs.has_java || steps.cached.outputs.has_java }}  (${{ steps.detect.outputs.java_location || steps.cached.outputs.java_location }})"
+          echo "Go:      ${{ steps.detect.outputs.has_go || steps.cached.outputs.has_go }}  (${{ steps.detect.outputs.go_location || steps.cached.outputs.go_location }})"
+          echo "npm:     ${{ steps.detect.outputs.has_npm || steps.cached.outputs.has_npm }}  (${{ steps.detect.outputs.npm_location || steps.cached.outputs.npm_location }})"
+          echo "Android: ${{ steps.detect.outputs.has_android || steps.cached.outputs.has_android }}  (${{ steps.detect.outputs.android_location || steps.cached.outputs.android_location }})"
+          echo "Flutter: ${{ steps.detect.outputs.has_flutter || steps.cached.outputs.has_flutter }}  (${{ steps.detect.outputs.flutter_location || steps.cached.outputs.flutter_location }})"
+          echo "Docker base images: ${{ steps.discover.outputs.images || steps.cached.outputs.images }}"
+
+      # Only runs on push (whatever branch the caller triggers this on) --
+      # persists the fresh detection as the cache the next PR's detect job
+      # will read, avoiding a live re-scan on every single PR.
+      - name: Write stack-detection cache
+        if: github.event_name == 'push'
+        run: |
+          python3 -c "
+          import json
+          data = {
+              'detect': {
+                  'has_java': '${{ steps.detect.outputs.has_java }}',
+                  'has_go': '${{ steps.detect.outputs.has_go }}',
+                  'has_npm': '${{ steps.detect.outputs.has_npm }}',
+                  'has_android': '${{ steps.detect.outputs.has_android }}',
+                  'has_flutter': '${{ steps.detect.outputs.has_flutter }}',
+                  'java_location': '${{ steps.detect.outputs.java_location }}',
+                  'go_location': '${{ steps.detect.outputs.go_location }}',
+                  'npm_location': '${{ steps.detect.outputs.npm_location }}',
+                  'android_location': '${{ steps.detect.outputs.android_location }}',
+                  'flutter_location': '${{ steps.detect.outputs.flutter_location }}',
+              },
+              'images': json.loads('${{ steps.discover.outputs.images }}' or '[]'),
+          }
+          json.dump(data, open('.pr-gate-cache.json', 'w'), indent=2)
+          print('Wrote .pr-gate-cache.json')
+          "
+
+      - name: Commit stack-detection cache
+        if: github.event_name == 'push'
+        uses: stefanzweifel/git-auto-commit-action@4a55954c782fc1ea30b9056cd3e7a2b40ca8887d  # v7.2.0
+        with:
+          commit_message: "chore(pr-gate): update stack-detection cache [skip ci]"
+          file_pattern: .pr-gate-cache.json
 
 # ─────────────────────────────────────────────
 # TIER 1 — Security (always run, all parallel)
@@ -425,64 +544,20 @@ jobs:
 # Scans each Dockerfile's base image(s) directly rather than a fully built
 # production image, so it does not need each stack's build artifacts/context —
 # it will not catch OS packages added via an explicit RUN apt/apk install step
-# in a Dockerfile, only what the base image itself ships.
+# in a Dockerfile, only what the base image itself ships. Discovery of which
+# base images exist now lives in the detect job (see its cache/live-detection
+# logic above) rather than a separate trivy-image-discover job, both to avoid
+# two parallel jobs racing to commit the same cache file and because it's the
+# same category of "what does this repo look like" work as stack detection.
 # ─────────────────────────────────────────────
-  trivy-image-discover:
-    name: Discover Dockerfile Base Images
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      images: ${{ steps.discover.outputs.images }}
-    steps:
-      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
-        with:
-          egress-policy: audit
-
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-
-      - name: Discover base images from all Dockerfiles
-        id: discover
-        run: |
-          python3 - <<'PYEOF'
-          import re, os, json
-
-          stage_pattern = re.compile(r'^\s*FROM\s+(\S+)(?:\s+[Aa][Ss]\s+(\S+))?', re.IGNORECASE)
-          base_images = set()
-          for root, dirs, files in os.walk('.'):
-              dirs[:] = [d for d in dirs if d not in ('.git', 'node_modules', 'vendor')]
-              for f in files:
-                  if f == 'Dockerfile' or f.startswith('Dockerfile.'):
-                      aliases = set()
-                      path = os.path.join(root, f)
-                      with open(path, encoding='utf-8', errors='ignore') as fh:
-                          for line in fh:
-                              m = stage_pattern.match(line)
-                              if not m:
-                                  continue
-                              image, alias = m.group(1), m.group(2)
-                              # Skip references to a previously-defined build
-                              # stage alias (not a real pullable image) and
-                              # FROM scratch (not a real image either).
-                              if image.lower() not in aliases and image.lower() != 'scratch':
-                                  base_images.add(image)
-                              if alias:
-                                  aliases.add(alias.lower())
-
-          images = sorted(base_images)
-          print("Discovered base images:", images)
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as gh_out:
-              gh_out.write(f"images={json.dumps(images)}\n")
-          PYEOF
-
   trivy-image-scan:
     name: Trivy Base Image Scan (${{ matrix.image }})
-    needs: trivy-image-discover
-    if: ${{ needs.trivy-image-discover.outputs.images != '[]' }}
+    needs: detect
+    if: ${{ needs.detect.outputs.images != '[]' }}
     strategy:
       fail-fast: false
       matrix:
-        image: ${{ fromJson(needs.trivy-image-discover.outputs.images) }}
+        image: ${{ fromJson(needs.detect.outputs.images) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
