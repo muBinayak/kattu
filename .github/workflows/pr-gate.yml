@@ -1,6 +1,11 @@
 name: PR Gate
 
 on:
+  # workflow_dispatch lets a caller repo run this gate manually from its own
+  # Actions tab (via a small local stub workflow with on: workflow_dispatch
+  # that does uses: this-file). spotbugs-security uses that trigger as its
+  # "full backlog scan" mode -- see SPOTBUGS_COMMENT_MODE below.
+  workflow_dispatch:
   workflow_call:
     inputs:
       SERVICE_LOCATION:
@@ -60,6 +65,11 @@ on:
         required: false
         type: string
         default: 'npm test -- --coverage'
+      SPOTBUGS_COMMENT_MODE:
+        description: '"diff" = the PR comment only shows SpotBugs/Find Security Bugs findings newly introduced vs the base branch (pre-existing backlog is omitted); "full" = comment shows every current finding on every PR. Only affects pull_request runs -- a manual workflow_dispatch run always does a full scan and uploads the report as a workflow artifact instead of a PR comment.'
+        required: false
+        type: string
+        default: 'diff'
     secrets:
       OSSRH_USER:
         required: false
@@ -635,9 +645,9 @@ jobs:
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           echo "SpotBugs finished with exit code $code (non-blocking)."
 
-      - name: Collect SARIF reports from every module
+      - name: Collect head SARIF reports
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/spotbugs-sarif"
+          mkdir -p "$GITHUB_WORKSPACE/spotbugs-sarif-head"
           find "${{ needs.detect.outputs.java_location }}" -name 'spotbugsSarif.json' -print0 | \
             while IFS= read -r -d '' f; do
               # Prefix with a letter: java_location often starts with "./", and
@@ -645,67 +655,138 @@ jobs:
               # start with a dot and become a hidden file -- invisible to plain
               # `ls` and to Python's glob.glob("*.sarif") in the next step.
               safe="report_$(echo "$f" | tr -c 'a-zA-Z0-9._-' '_')"
-              cp "$f" "$GITHUB_WORKSPACE/spotbugs-sarif/${safe}.sarif"
+              cp "$f" "$GITHUB_WORKSPACE/spotbugs-sarif-head/${safe}.sarif"
             done
-          echo "Collected $(find "$GITHUB_WORKSPACE/spotbugs-sarif" -maxdepth 1 -name '*.sarif' 2>/dev/null | wc -l) SARIF file(s)."
+          echo "Collected $(find "$GITHUB_WORKSPACE/spotbugs-sarif-head" -maxdepth 1 -name '*.sarif' 2>/dev/null | wc -l) head SARIF file(s)."
 
       - name: Upload SARIF to Security tab
         uses: github/codeql-action/upload-sarif@4e828ff8d448a8a6e532957b1811f387a63867e8  # v3.29.4
         if: always()
         with:
-          sarif_file: spotbugs-sarif
+          sarif_file: spotbugs-sarif-head
           category: spotbugs-findsecbugs
+
+      # Diff mode also scans the PR's base ref, so the comment can show only
+      # findings this PR actually introduces instead of repeating a long-lived
+      # backlog on every single PR. Skipped entirely outside pull_request
+      # (e.g. a manual workflow_dispatch backlog run always does a full scan).
+      - name: Checkout base ref for diff comparison
+        if: inputs.SPOTBUGS_COMMENT_MODE == 'diff' && github.event_name == 'pull_request'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: spotbugs-base
+
+      - name: Compile base ref
+        if: inputs.SPOTBUGS_COMMENT_MODE == 'diff' && github.event_name == 'pull_request'
+        run: |
+          cd "spotbugs-base/${{ needs.detect.outputs.java_location }}"
+          mvn -U -B compile -Dgpg.skip=true -Dmaven.wagon.http.retryHandler.count=2 \
+            --file pom.xml -s "$GITHUB_WORKSPACE/settings.xml"
+
+      - name: Run SpotBugs + Find Security Bugs (base ref, for diffing)
+        if: inputs.SPOTBUGS_COMMENT_MODE == 'diff' && github.event_name == 'pull_request'
+        run: |
+          cd "spotbugs-base/${{ needs.detect.outputs.java_location }}"
+          set +e
+          mvn -B com.github.spotbugs:spotbugs-maven-plugin:4.10.4.1:spotbugs \
+            -Dspotbugs.pluginList="$GITHUB_WORKSPACE/findsecbugs-plugin.jar" \
+            -Dspotbugs.sarifOutput=true \
+            --file pom.xml -s "$GITHUB_WORKSPACE/settings.xml"
+          set -e
+
+      - name: Collect base SARIF reports
+        if: inputs.SPOTBUGS_COMMENT_MODE == 'diff' && github.event_name == 'pull_request'
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/spotbugs-sarif-base"
+          find "spotbugs-base/${{ needs.detect.outputs.java_location }}" -name 'spotbugsSarif.json' -print0 | \
+            while IFS= read -r -d '' f; do
+              safe="report_$(echo "$f" | tr -c 'a-zA-Z0-9._-' '_')"
+              cp "$f" "$GITHUB_WORKSPACE/spotbugs-sarif-base/${safe}.sarif"
+            done
+          echo "Collected $(find "$GITHUB_WORKSPACE/spotbugs-sarif-base" -maxdepth 1 -name '*.sarif' 2>/dev/null | wc -l) base SARIF file(s)."
 
       # Builds a per-finding table with a direct link to find-sec-bugs' own
       # pattern-detail page (bugs.htm#<RULE_ID>) so every row has concrete fix
-      # guidance, not just a bare pattern name.
-      - name: Build PR comment with fix guidance
+      # guidance, not just a bare pattern name. In diff mode on a PR, a
+      # finding is considered "new" if its (rule ID, file path) pair is absent
+      # from the base ref's scan -- line number is deliberately excluded from
+      # the match since unrelated nearby edits can shift bytecode line refs
+      # slightly without the underlying finding actually being new.
+      - name: Build report
         if: always()
         run: |
           python3 - <<'PYEOF'
           import json, glob, os
 
-          findings = []
-          sarif_dir = os.path.join(os.environ["GITHUB_WORKSPACE"], "spotbugs-sarif")
-          for path in glob.glob(os.path.join(sarif_dir, "*.sarif")):
-              try:
-                  with open(path, encoding="utf-8") as fh:
-                      sarif = json.load(fh)
-              except (json.JSONDecodeError, OSError):
-                  continue
-              for run in sarif.get("runs", []):
-                  rules = {r["id"]: r for r in run.get("tool", {}).get("driver", {}).get("rules", [])}
-                  for result in run.get("results", []):
-                      rule_id = result.get("ruleId", "UNKNOWN")
-                      rule = rules.get(rule_id, {})
-                      message = result.get("message", {}).get("text", "").strip().replace("|", "\\|")
-                      loc = (result.get("locations") or [{}])[0].get("physicalLocation", {})
-                      uri = loc.get("artifactLocation", {}).get("uri", "?")
-                      line = loc.get("region", {}).get("startLine", "?")
-                      severity = result.get("level", "warning")
-                      short_desc = rule.get("shortDescription", {}).get("text", rule_id)
-                      findings.append({
-                          "rule_id": rule_id,
-                          "short_desc": short_desc,
-                          "message": message,
-                          "uri": uri,
-                          "line": line,
-                          "severity": severity,
-                      })
+          def load_findings(sarif_dir):
+              findings = []
+              for path in glob.glob(os.path.join(sarif_dir, "*.sarif")):
+                  try:
+                      with open(path, encoding="utf-8") as fh:
+                          sarif = json.load(fh)
+                  except (json.JSONDecodeError, OSError):
+                      continue
+                  for run in sarif.get("runs", []):
+                      rules = {r["id"]: r for r in run.get("tool", {}).get("driver", {}).get("rules", [])}
+                      for result in run.get("results", []):
+                          rule_id = result.get("ruleId", "UNKNOWN")
+                          rule = rules.get(rule_id, {})
+                          message = result.get("message", {}).get("text", "").strip().replace("|", "\\|")
+                          loc = (result.get("locations") or [{}])[0].get("physicalLocation", {})
+                          uri = loc.get("artifactLocation", {}).get("uri", "?")
+                          line = loc.get("region", {}).get("startLine", "?")
+                          severity = result.get("level", "warning")
+                          short_desc = rule.get("shortDescription", {}).get("text", rule_id)
+                          findings.append({
+                              "rule_id": rule_id,
+                              "short_desc": short_desc,
+                              "message": message,
+                              "uri": uri,
+                              "line": line,
+                              "severity": severity,
+                          })
+              return findings
 
-          out = os.path.join(os.environ["GITHUB_WORKSPACE"], "spotbugs-comment.md")
+          workspace = os.environ["GITHUB_WORKSPACE"]
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+          mode = os.environ.get("SPOTBUGS_COMMENT_MODE", "diff")
+
+          head_findings = load_findings(os.path.join(workspace, "spotbugs-sarif-head"))
+          diff_active = (mode == "diff" and event_name == "pull_request")
+
+          if diff_active:
+              base_findings = load_findings(os.path.join(workspace, "spotbugs-sarif-base"))
+              base_keys = {(f["rule_id"], f["uri"]) for f in base_findings}
+              shown = [f for f in head_findings if (f["rule_id"], f["uri"]) not in base_keys]
+              pre_existing_count = len(head_findings) - len(shown)
+          else:
+              shown = head_findings
+              pre_existing_count = 0
+
+          out = os.path.join(workspace, "spotbugs-comment.md")
           with open(out, "w", encoding="utf-8") as f:
               f.write("## SpotBugs + Find Security Bugs\n\n")
-              if not findings:
-                  f.write("No SpotBugs / Find Security Bugs findings.\n")
+              if diff_active:
+                  f.write(
+                      "_Showing findings newly introduced by this PR only. %d pre-existing "
+                      "finding(s) also exist in the codebase (not shown here -- run this "
+                      "workflow manually via workflow_dispatch for the full backlog)._\n\n"
+                      % pre_existing_count
+                  )
+              if not shown:
+                  f.write(
+                      "No SpotBugs / Find Security Bugs findings"
+                      + (" introduced by this PR.\n" if diff_active else ".\n")
+                  )
               else:
                   f.write(
                       "> **%d finding(s).** This check is **non-blocking** and will not fail "
-                      "the PR, but please review the items below.\n\n" % len(findings)
+                      "the PR, but please review the items below.\n\n" % len(shown)
                   )
                   f.write("| Severity | File:Line | Bug Pattern | Message | How to fix |\n")
                   f.write("|---|---|---|---|---|\n")
-                  for item in findings:
+                  for item in shown:
                       fix_link = "https://find-sec-bugs.github.io/bugs.htm#" + item["rule_id"]
                       f.write(
                           "| %s | `%s:%s` | `%s` (%s) | %s | [Fix guidance](%s) |\n"
@@ -716,8 +797,13 @@ jobs:
                       "\n<sub>Full SARIF detail is also available under the repo's Security tab "
                       "(category `spotbugs-findsecbugs`).</sub>\n"
                   )
-          print("Wrote comment with %d finding(s)." % len(findings))
+          print(
+              "Wrote report with %d finding(s) (mode=%s, diff_active=%s)."
+              % (len(shown), mode, diff_active)
+          )
           PYEOF
+        env:
+          SPOTBUGS_COMMENT_MODE: ${{ inputs.SPOTBUGS_COMMENT_MODE }}
 
       - name: Post SpotBugs findings comment
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
@@ -725,6 +811,18 @@ jobs:
         with:
           header: spotbugs
           path: spotbugs-comment.md
+
+      # Non-PR triggers (a manual workflow_dispatch backlog run) have no PR to
+      # comment on -- upload the full report as a downloadable artifact.
+      - name: Upload report as artifact (non-PR runs)
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: spotbugs-backlog-report
+          path: |
+            spotbugs-comment.md
+            spotbugs-sarif-head/
+          if-no-files-found: warn
 
 
 # ─────────────────────────────────────────────
