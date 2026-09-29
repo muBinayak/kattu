@@ -273,6 +273,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      pull-requests: write   # reviewdog inline PR review comments
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
@@ -282,10 +283,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e  # v3.0.0
-        env:
-          GITHUB_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+      # Runs the open-source gitleaks CLI directly (no GITLEAKS_LICENSE needed --
+      # that was specific to gitleaks/gitleaks-action's own distribution model,
+      # not a limitation of gitleaks itself) and posts findings as inline PR
+      # review comments via reviewdog. filter_mode: added (the action's default)
+      # only flags secrets on lines this PR actually introduces, not the whole
+      # repo's history on every PR.
+      - uses: reviewdog/action-gitleaks@2b7b5685e3e3eecddab5d30cfa04f18123031421  # v1.8.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          reporter: github-pr-review
+          level: error
+          fail_level: error
 
   dependency-review:
     name: Dependency CVE Review
@@ -310,6 +319,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      pull-requests: write   # reviewdog inline PR review comments
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
@@ -317,15 +327,13 @@ jobs:
 
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
-      - name: Install actionlint
-        run: |
-          ACTIONLINT_VERSION="1.7.7"
-          curl -sSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
-            | tar xz actionlint
-          sudo mv actionlint /usr/local/bin/
-
-      - name: Run actionlint
-        run: actionlint
+      # Official reviewdog integration -- runs actionlint and posts inline PR
+      # review comments in one step, replacing the previous manual install+run.
+      - uses: reviewdog/action-actionlint@2085657ab2c7f48c58edcc767fba576f63bea76b  # v1.77.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          reporter: github-pr-review
+          fail_level: error
 
   trivy-fs:
     name: Trivy Filesystem Vulnerability Scan
@@ -474,6 +482,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      pull-requests: write   # reviewdog inline PR review comments
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
@@ -498,12 +507,26 @@ jobs:
           sarif_file: trivy-config.sarif
           category: trivy-config
 
+      - uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f  # v1.5.0
+        if: github.event_name == 'pull_request'
+        with:
+          reviewdog_version: v0.21.2
+
+      - name: Post inline PR comments
+        if: github.event_name == 'pull_request'
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          reviewdog -f=sarif -name="trivy-config" -reporter=github-pr-review \
+            -filter-mode=nofilter -fail-level=none < trivy-config.sarif
+
   semgrep:
     name: Semgrep SAST
     runs-on: ubuntu-latest
     permissions:
       contents: read
       security-events: write
+      pull-requests: write   # reviewdog inline PR review comments
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
@@ -537,6 +560,19 @@ jobs:
           sarif_file: semgrep.sarif
           category: semgrep
 
+      - uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f  # v1.5.0
+        if: github.event_name == 'pull_request'
+        with:
+          reviewdog_version: v0.21.2
+
+      - name: Post inline PR comments
+        if: github.event_name == 'pull_request'
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          reviewdog -f=sarif -name="semgrep" -reporter=github-pr-review \
+            -filter-mode=nofilter -fail-level=none < semgrep.sarif
+
 # ─────────────────────────────────────────────
 # Trivy base-image scan — OS-package vulnerabilities only. Deliberately scoped
 # with vuln-type: os to avoid duplicating trivy-fs, which already covers
@@ -562,6 +598,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      pull-requests: write   # reviewdog inline PR review comments
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
@@ -588,6 +625,21 @@ jobs:
         with:
           sarif_file: trivy-image.sarif
           category: trivy-image-${{ steps.safe.outputs.name }}
+
+      # Each matrix instance (one per discovered base image) posts its own PR
+      # comments independently -- no separate aggregation job needed.
+      - uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f  # v1.5.0
+        if: github.event_name == 'pull_request'
+        with:
+          reviewdog_version: v0.21.2
+
+      - name: Post inline PR comments
+        if: github.event_name == 'pull_request'
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          reviewdog -f=sarif -name="trivy-image-${{ steps.safe.outputs.name }}" \
+            -reporter=github-pr-review -filter-mode=nofilter -fail-level=none < trivy-image.sarif
 
   android-lint:
     name: Android Lint (security-relevant checks)
