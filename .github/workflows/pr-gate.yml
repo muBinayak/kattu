@@ -518,7 +518,7 @@ jobs:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           reviewdog -f=sarif -name="trivy-config" -reporter=github-pr-review \
-            -filter-mode=nofilter -fail-level=none < trivy-config.sarif
+            -filter-mode=added -fail-level=none < trivy-config.sarif
 
   semgrep:
     name: Semgrep SAST
@@ -571,7 +571,7 @@ jobs:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           reviewdog -f=sarif -name="semgrep" -reporter=github-pr-review \
-            -filter-mode=nofilter -fail-level=none < semgrep.sarif
+            -filter-mode=added -fail-level=none < semgrep.sarif
 
 # ─────────────────────────────────────────────
 # Trivy base-image scan — OS-package vulnerabilities only. Deliberately scoped
@@ -639,7 +639,7 @@ jobs:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           reviewdog -f=sarif -name="trivy-image-${{ steps.safe.outputs.name }}" \
-            -reporter=github-pr-review -filter-mode=nofilter -fail-level=none < trivy-image.sarif
+            -reporter=github-pr-review -filter-mode=added -fail-level=none < trivy-image.sarif
 
   android-lint:
     name: Android Lint (security-relevant checks)
