@@ -604,6 +604,16 @@ jobs:
         with:
           egress-policy: audit
 
+      # Needed only for reviewdog below, which requires a .git directory to
+      # exist even with -filter-mode=nofilter -- the scan itself just needs
+      # the image reference, not repo content. nofilter (not added) because
+      # OS-package findings point to paths inside the container image, not
+      # files in this repo, so they would never match any diff line anyway;
+      # annotation volume here is naturally small (a handful of OS CVEs per
+      # image), unlike a whole-repo SAST scan.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        if: github.event_name == 'pull_request'
+
       - name: Sanitize image reference for artifact/category naming
         id: safe
         run: echo "name=$(echo '${{ matrix.image }}' | tr -c 'a-zA-Z0-9._-' '_')" >> "$GITHUB_OUTPUT"
@@ -639,7 +649,7 @@ jobs:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           reviewdog -f=sarif -name="trivy-image-${{ steps.safe.outputs.name }}" \
-            -reporter=github-pr-review -filter-mode=added -fail-level=none < trivy-image.sarif
+            -reporter=github-pr-review -filter-mode=nofilter -fail-level=none < trivy-image.sarif
 
   android-lint:
     name: Android Lint (security-relevant checks)
