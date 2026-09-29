@@ -454,7 +454,7 @@ jobs:
 
       - name: Upload SARIF to Security tab
         uses: github/codeql-action/upload-sarif@4e828ff8d448a8a6e532957b1811f387a63867e8  # v3.29.4
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         with:
           sarif_file: trivy-fs.sarif
           category: trivy-fs
@@ -493,7 +493,7 @@ jobs:
 
       - name: Upload results to Security tab
         uses: github/codeql-action/upload-sarif@4e828ff8d448a8a6e532957b1811f387a63867e8  # v3.29.4
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         with:
           sarif_file: trivy-config.sarif
           category: trivy-config
@@ -532,7 +532,7 @@ jobs:
 
       - name: Upload SARIF to Security tab
         uses: github/codeql-action/upload-sarif@4e828ff8d448a8a6e532957b1811f387a63867e8  # v3.29.4
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         with:
           sarif_file: semgrep.sarif
           category: semgrep
@@ -584,7 +584,7 @@ jobs:
 
       - name: Upload SARIF to Security tab
         uses: github/codeql-action/upload-sarif@4e828ff8d448a8a6e532957b1811f387a63867e8  # v3.29.4
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         with:
           sarif_file: trivy-image.sarif
           category: trivy-image-${{ steps.safe.outputs.name }}
@@ -736,7 +736,7 @@ jobs:
 
       - name: Upload SARIF to Security tab
         uses: github/codeql-action/upload-sarif@4e828ff8d448a8a6e532957b1811f387a63867e8  # v3.29.4
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         with:
           sarif_file: spotbugs-sarif-head
           category: spotbugs-findsecbugs
