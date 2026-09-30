@@ -70,6 +70,11 @@ on:
         required: false
         type: string
         default: 'diff'
+      PROTECTED_BRANCHES:
+        description: 'Comma-separated list of PR base-branch patterns (glob, e.g. "release-*") that enforce hard blocking on findings. A PR targeting any other branch gets the same scans and comments, but nothing here fails the PR -- findings surface for review, not as a merge blocker. Override per caller to match its own branch naming.'
+        required: false
+        type: string
+        default: 'master,main,develop,release-*'
     secrets:
       OSSRH_USER:
         required: false
@@ -104,6 +109,7 @@ jobs:
       android_location: ${{ steps.detect.outputs.android_location || steps.cached.outputs.android_location }}
       flutter_location: ${{ steps.detect.outputs.flutter_location || steps.cached.outputs.flutter_location }}
       images:           ${{ steps.discover.outputs.images || steps.cached.outputs.images }}
+      is_protected:     ${{ steps.branch-check.outputs.is_protected }}
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
@@ -112,6 +118,28 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           fetch-depth: 0
+
+      # Determines whether this run enforces hard blocking. On a pull_request,
+      # checks the PR's base branch against PROTECTED_BRANCHES (glob patterns).
+      # On push/workflow_dispatch there's no PR to merge, so nothing here needs
+      # to block anything -- treated as protected only in the sense that these
+      # triggers are what write the stack-detection cache, unrelated to blocking.
+      - name: Check whether this PR targets a protected branch
+        id: branch-check
+        run: |
+          IS_PROTECTED=false
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_REF="${{ github.event.pull_request.base.ref }}"
+            IFS=',' read -ra PATTERNS <<< "${{ inputs.PROTECTED_BRANCHES }}"
+            for pattern in "${PATTERNS[@]}"; do
+              pattern="$(echo "$pattern" | xargs)"  # trim whitespace
+              case "$BASE_REF" in
+                $pattern) IS_PROTECTED=true ;;
+              esac
+            done
+          fi
+          echo "is_protected=$IS_PROTECTED" >> "$GITHUB_OUTPUT"
+          echo "PR base ref: ${{ github.event.pull_request.base.ref }} -- protected: $IS_PROTECTED"
 
       # On a PR, reuse the detection cache committed by the last push to the
       # base branch instead of recomputing from scratch on every PR (stack
@@ -270,6 +298,7 @@ jobs:
 # ─────────────────────────────────────────────
   secret-scan:
     name: Secret Scan
+    needs: detect
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -288,8 +317,11 @@ jobs:
       # not a limitation of gitleaks itself) and posts findings as inline PR
       # review comments via reviewdog. filter_mode: added (the action's default)
       # only flags secrets on lines this PR actually introduces, not the whole
-      # repo's history on every PR.
+      # repo's history on every PR. continue-on-error makes this advisory on
+      # any branch not listed in PROTECTED_BRANCHES -- see that input's
+      # description for the reasoning.
       - uses: reviewdog/action-gitleaks@2b7b5685e3e3eecddab5d30cfa04f18123031421  # v1.8.0
+        continue-on-error: ${{ needs.detect.outputs.is_protected != 'true' }}
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           reporter: github-pr-review
@@ -298,6 +330,7 @@ jobs:
 
   dependency-review:
     name: Dependency CVE Review
+    needs: detect
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -310,12 +343,14 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294  # v5.0.0
+        continue-on-error: ${{ needs.detect.outputs.is_protected != 'true' }}
         with:
           fail-on-severity: high
           comment-summary-in-pr: always
 
   lint-workflows:
     name: Lint GitHub Actions Workflows
+    needs: detect
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -330,6 +365,7 @@ jobs:
       # Official reviewdog integration -- runs actionlint and posts inline PR
       # review comments in one step, replacing the previous manual install+run.
       - uses: reviewdog/action-actionlint@2085657ab2c7f48c58edcc767fba576f63bea76b  # v1.77.0
+        continue-on-error: ${{ needs.detect.outputs.is_protected != 'true' }}
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           reporter: github-pr-review
@@ -337,6 +373,7 @@ jobs:
 
   trivy-fs:
     name: Trivy Filesystem Vulnerability Scan
+    needs: detect
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -468,7 +505,10 @@ jobs:
           category: trivy-fs
 
       # ── Step E: Gate — fail the job if HIGH/CRITICAL exist ────────────────
+      # continue-on-error makes this advisory on any branch not listed in
+      # PROTECTED_BRANCHES; the comment above still shows every finding either way.
       - name: Gate on HIGH/CRITICAL findings
+        continue-on-error: ${{ needs.detect.outputs.is_protected != 'true' }}
         run: |
           if grep -qE "^Total: [1-9]" trivy-report.txt 2>/dev/null; then
             echo "::error::HIGH or CRITICAL vulnerabilities found. Review the Trivy comment on this PR."
@@ -1017,7 +1057,7 @@ jobs:
           token: ${{ secrets.CODECOV_LICENSE }}
           files: '${{ needs.detect.outputs.java_location }}/**/target/site/jacoco/jacoco.xml'
           flags: java
-          fail_ci_if_error: true
+          fail_ci_if_error: ${{ needs.detect.outputs.is_protected == 'true' }}
 
   coverage-go:
     name: Go Coverage → Codecov
@@ -1049,7 +1089,7 @@ jobs:
           token: ${{ secrets.CODECOV_LICENSE }}
           files: ${{ needs.detect.outputs.go_location }}/coverage.out
           flags: go
-          fail_ci_if_error: true
+          fail_ci_if_error: ${{ needs.detect.outputs.is_protected == 'true' }}
 
   coverage-npm:
     name: npm Coverage → Codecov
@@ -1087,7 +1127,7 @@ jobs:
           token: ${{ secrets.CODECOV_LICENSE }}
           files: '${{ needs.detect.outputs.npm_location }}/coverage/lcov.info'
           flags: npm
-          fail_ci_if_error: true
+          fail_ci_if_error: ${{ needs.detect.outputs.is_protected == 'true' }}
 
   coverage-android:
     name: Android Coverage → Codecov
@@ -1119,7 +1159,7 @@ jobs:
           token: ${{ secrets.CODECOV_LICENSE }}
           files: '${{ needs.detect.outputs.android_location }}/**/build/reports/jacoco/**/*.xml'
           flags: android
-          fail_ci_if_error: true
+          fail_ci_if_error: ${{ needs.detect.outputs.is_protected == 'true' }}
 
   coverage-flutter:
     name: Flutter Coverage → Codecov
@@ -1157,7 +1197,7 @@ jobs:
           token: ${{ secrets.CODECOV_LICENSE }}
           files: '${{ needs.detect.outputs.flutter_location }}/coverage/lcov.info'
           flags: flutter
-          fail_ci_if_error: true
+          fail_ci_if_error: ${{ needs.detect.outputs.is_protected == 'true' }}
 
 # ─────────────────────────────────────────────
 # TIER 2 — Supply-chain integrity (POM-gated)
