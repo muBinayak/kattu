@@ -85,6 +85,12 @@ on:
       GITLEAKS_LICENSE:
         required: false
 
+# A new push to a PR cancels that PR's still-running gate, so superseded runs do
+# not keep occupying the org's shared runner pool. Never cancels push runs.
+concurrency:
+  group: pr-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
 # ─────────────────────────────────────────────
 # DETECT — Check for stack marker files at the
@@ -327,6 +333,8 @@ jobs:
           reporter: github-pr-review
           level: error
           fail_level: error
+          # On a PR, scan only the commits the PR adds, not the repo's whole history.
+          gitleaks_flags: ${{ github.event_name == 'pull_request' && format('--log-opts={0}..{1}', github.event.pull_request.base.sha, github.event.pull_request.head.sha) || '' }}
 
   dependency-review:
     name: Dependency CVE Review
@@ -346,7 +354,7 @@ jobs:
         continue-on-error: ${{ needs.detect.outputs.is_protected != 'true' }}
         with:
           fail-on-severity: high
-          comment-summary-in-pr: always
+          comment-summary-in-pr: on-failure
 
   lint-workflows:
     name: Lint GitHub Actions Workflows
@@ -453,10 +461,7 @@ jobs:
                 printf '%b' "$new_rows"
               } > "$COMMENT_FILE"
             else
-              {
-                echo "## Trivy Security Scan"
-                echo "✅ No NEW HIGH/CRITICAL vulnerabilities introduced by this PR."
-              } > "$COMMENT_FILE"
+              : > "$COMMENT_FILE"
             fi
           else
             if grep -qE "^Total: [1-9]" trivy-report.txt 2>/dev/null; then
@@ -468,23 +473,33 @@ jobs:
                 echo '```'
               } > "$COMMENT_FILE"
             else
-              {
-                echo "## Trivy Security Scan"
-                echo "✅ No HIGH/CRITICAL findings."
-              } > "$COMMENT_FILE"
+              : > "$COMMENT_FILE"
             fi
           fi
 
-      # ── Step D: Post sticky PR comment (skip on forks — token is read-only) ─
+      # ── Step D: Post sticky PR comment only when there is something to report ─
+      # A clean scan posts nothing, and removes a stale comment left by an earlier push.
+      - name: Check whether Trivy has anything to report
+        id: trivy-has-findings
+        run: |
+          if [ -s trivy-comment.md ]; then echo "value=true" >> "$GITHUB_OUTPUT"; else echo "value=false" >> "$GITHUB_OUTPUT"; fi
+
       - name: Post Trivy findings comment
         # Comment only on same-repo PRs (the default token can't write to a base repo from a
         # cross-fork PR). NOTE: head.repo.fork is true whenever the repo itself is a fork of an
         # upstream, so compare head/base repo names instead of using !head.repo.fork.
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name && steps.trivy-has-findings.outputs.value == 'true'
         uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0  # v3.0.4
         with:
           header: trivy
           path: trivy-comment.md
+
+      - name: Remove stale Trivy comment (now clean)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name && steps.trivy-has-findings.outputs.value != 'true'
+        uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0  # v3.0.4
+        with:
+          header: trivy
+          delete: true
 
       # ── SARIF upload for Security tab (always, independent of gate) ───────
       - name: Trivy SARIF scan
@@ -632,6 +647,7 @@ jobs:
     if: ${{ needs.detect.outputs.images != '[]' }}
     strategy:
       fail-fast: false
+      max-parallel: 3        # cap parallel image scans so one PR cannot flood the shared runner pool
       matrix:
         image: ${{ fromJson(needs.detect.outputs.images) }}
     runs-on: ubuntu-latest
@@ -854,7 +870,12 @@ jobs:
           ref: ${{ github.event.pull_request.base.sha }}
           path: spotbugs-base
 
+      # The base ref can fail to build for reasons unrelated to this PR (e.g. a
+      # SNAPSHOT dependency that is no longer published). When that happens, fall
+      # back to reporting all head findings instead of failing the job.
       - name: Compile base ref
+        id: base-compile
+        continue-on-error: true
         if: inputs.SPOTBUGS_COMMENT_MODE == 'diff' && github.event_name == 'pull_request'
         run: |
           cd "spotbugs-base/${{ needs.detect.outputs.java_location }}"
@@ -862,7 +883,7 @@ jobs:
             --file pom.xml -s "$GITHUB_WORKSPACE/settings.xml"
 
       - name: Run SpotBugs + Find Security Bugs (base ref, for diffing)
-        if: inputs.SPOTBUGS_COMMENT_MODE == 'diff' && github.event_name == 'pull_request'
+        if: inputs.SPOTBUGS_COMMENT_MODE == 'diff' && github.event_name == 'pull_request' && steps.base-compile.outcome == 'success'
         run: |
           cd "spotbugs-base/${{ needs.detect.outputs.java_location }}"
           set +e
@@ -873,7 +894,7 @@ jobs:
           set -e
 
       - name: Collect base SARIF reports
-        if: inputs.SPOTBUGS_COMMENT_MODE == 'diff' && github.event_name == 'pull_request'
+        if: inputs.SPOTBUGS_COMMENT_MODE == 'diff' && github.event_name == 'pull_request' && steps.base-compile.outcome == 'success'
         run: |
           mkdir -p "$GITHUB_WORKSPACE/spotbugs-sarif-base"
           find "spotbugs-base/${{ needs.detect.outputs.java_location }}" -name 'spotbugsSarif.json' -print0 | \
@@ -930,7 +951,9 @@ jobs:
           mode = os.environ.get("SPOTBUGS_COMMENT_MODE", "diff")
 
           head_findings = load_findings(os.path.join(workspace, "spotbugs-sarif-head"))
-          diff_active = (mode == "diff" and event_name == "pull_request")
+          base_ok = os.environ.get("BASE_BUILD_OK") == "true"
+          diff_active = (mode == "diff" and event_name == "pull_request" and base_ok)
+          base_failed = (mode == "diff" and event_name == "pull_request" and not base_ok)
 
           if diff_active:
               base_findings = load_findings(os.path.join(workspace, "spotbugs-sarif-base"))
@@ -951,12 +974,12 @@ jobs:
                       "workflow manually via workflow_dispatch for the full backlog)._\n\n"
                       % pre_existing_count
                   )
-              if not shown:
+              if base_failed:
                   f.write(
-                      "No SpotBugs / Find Security Bugs findings"
-                      + (" introduced by this PR.\n" if diff_active else ".\n")
+                      "_The PR's base ref could not be built, so this lists ALL findings "
+                      "(including pre-existing ones) rather than only newly introduced ones._\n\n"
                   )
-              else:
+              if shown:
                   f.write(
                       "> **%d finding(s).** This check is **non-blocking** and will not fail "
                       "the PR, but please review the items below.\n\n" % len(shown)
@@ -974,6 +997,8 @@ jobs:
                       "\n<sub>Full SARIF detail is also available under the repo's Security tab "
                       "(category `spotbugs-findsecbugs`).</sub>\n"
                   )
+          if not shown:
+              open(out, "w").close()
           print(
               "Wrote report with %d finding(s) (mode=%s, diff_active=%s)."
               % (len(shown), mode, diff_active)
@@ -981,13 +1006,27 @@ jobs:
           PYEOF
         env:
           SPOTBUGS_COMMENT_MODE: ${{ inputs.SPOTBUGS_COMMENT_MODE }}
+          BASE_BUILD_OK: ${{ steps.base-compile.outcome == 'success' }}
+
+      - name: Check whether SpotBugs has anything to report
+        id: sb-has-findings
+        if: always()
+        run: |
+          if [ -s spotbugs-comment.md ]; then echo "value=true" >> "$GITHUB_OUTPUT"; else echo "value=false" >> "$GITHUB_OUTPUT"; fi
 
       - name: Post SpotBugs findings comment
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name && steps.sb-has-findings.outputs.value == 'true'
         uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0  # v3.0.4
         with:
           header: spotbugs
           path: spotbugs-comment.md
+
+      - name: Remove stale SpotBugs comment (now clean)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name && steps.sb-has-findings.outputs.value != 'true'
+        uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0  # v3.0.4
+        with:
+          header: spotbugs
+          delete: true
 
       # Non-PR triggers (a manual workflow_dispatch backlog run) have no PR to
       # comment on -- upload the full report as a downloadable artifact.
@@ -1279,11 +1318,7 @@ jobs:
             | head -100 || true)"
 
           if [ "$CODE" = "0" ]; then
-            {
-              echo "## 🔐 pgpverify — Maven Dependency Signature Check"
-              echo ""
-              echo "✅ All resolved dependency & plugin PGP signatures verified."
-            } > "$OUT"
+            : > "$OUT"
           else
             {
               echo "## 🔐 pgpverify — Maven Dependency Signature Check"
@@ -1313,9 +1348,21 @@ jobs:
 
       # Sticky comment on same-repo PRs only (a read-only token can't comment from
       # a cross-fork PR) — same guard as the Trivy filesystem job.
+      - name: Check whether pgpverify has anything to report
+        id: pgp-has-findings
+        run: |
+          if [ -s pgpverify-comment.md ]; then echo "value=true" >> "$GITHUB_OUTPUT"; else echo "value=false" >> "$GITHUB_OUTPUT"; fi
+
       - name: Post pgpverify findings comment
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name && steps.pgp-has-findings.outputs.value == 'true'
         uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0  # v3.0.4
         with:
           header: pgpverify
           path: pgpverify-comment.md
+
+      - name: Remove stale pgpverify comment (now clean)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name && steps.pgp-has-findings.outputs.value != 'true'
+        uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0  # v3.0.4
+        with:
+          header: pgpverify
+          delete: true
