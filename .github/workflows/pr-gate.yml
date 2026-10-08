@@ -818,14 +818,25 @@ jobs:
           curl -sSL --fail -o "$GITHUB_WORKSPACE/findsecbugs-plugin.jar" \
             "https://repo1.maven.org/maven2/com/h3xstream/findsecbugs/findsecbugs-plugin/1.14.0/findsecbugs-plugin-1.14.0.jar"
 
+      # If the project itself cannot be compiled (e.g. a pom problem a newer Maven
+      # rejects), skip SpotBugs rather than failing the PR for a tooling reason.
       - name: Compile (SpotBugs analyzes bytecode, not source)
+        id: head-compile
+        continue-on-error: true
         run: |
           cd "${{ needs.detect.outputs.java_location }}"
           mvn -U -B compile -Dgpg.skip=true -Dmaven.wagon.http.retryHandler.count=2 \
             --file pom.xml -s "$GITHUB_WORKSPACE/settings.xml"
 
+      - name: Note that SpotBugs was skipped
+        if: steps.head-compile.outcome == 'failure'
+        run: |
+          echo "::warning title=SpotBugs skipped::The project could not be compiled, so SpotBugs did not run. See the Compile step log."
+          printf '### SpotBugs skipped\nThe project could not be compiled, so SpotBugs did not run. See the Compile step log.\n' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Run SpotBugs + Find Security Bugs (non-blocking)
         id: spotbugs
+        if: steps.head-compile.outcome == 'success'
         run: |
           cd "${{ needs.detect.outputs.java_location }}"
           set +e
@@ -839,6 +850,7 @@ jobs:
           echo "SpotBugs finished with exit code $code (non-blocking)."
 
       - name: Collect head SARIF reports
+        if: steps.head-compile.outcome == 'success'
         run: |
           mkdir -p "$GITHUB_WORKSPACE/spotbugs-sarif-head"
           find "${{ needs.detect.outputs.java_location }}" -name 'spotbugsSarif.json' -print0 | \
@@ -854,7 +866,7 @@ jobs:
 
       - name: Upload SARIF to Security tab
         uses: github/codeql-action/upload-sarif@4e828ff8d448a8a6e532957b1811f387a63867e8  # v3.29.4
-        if: always() && github.event_name != 'pull_request'
+        if: always() && github.event_name != 'pull_request' && steps.head-compile.outcome == 'success'
         with:
           sarif_file: spotbugs-sarif-head
           category: spotbugs-findsecbugs
@@ -864,7 +876,7 @@ jobs:
       # backlog on every single PR. Skipped entirely outside pull_request
       # (e.g. a manual workflow_dispatch backlog run always does a full scan).
       - name: Checkout base ref for diff comparison
-        if: inputs.SPOTBUGS_COMMENT_MODE == 'diff' && github.event_name == 'pull_request'
+        if: inputs.SPOTBUGS_COMMENT_MODE == 'diff' && github.event_name == 'pull_request' && steps.head-compile.outcome == 'success'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ github.event.pull_request.base.sha }}
@@ -876,7 +888,7 @@ jobs:
       - name: Compile base ref
         id: base-compile
         continue-on-error: true
-        if: inputs.SPOTBUGS_COMMENT_MODE == 'diff' && github.event_name == 'pull_request'
+        if: inputs.SPOTBUGS_COMMENT_MODE == 'diff' && github.event_name == 'pull_request' && steps.head-compile.outcome == 'success'
         run: |
           cd "spotbugs-base/${{ needs.detect.outputs.java_location }}"
           mvn -U -B compile -Dgpg.skip=true -Dmaven.wagon.http.retryHandler.count=2 \
