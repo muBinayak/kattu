@@ -292,8 +292,12 @@ jobs:
           print('Wrote .pr-gate-cache.json')
           "
 
+      # The cache is only an optimisation (a missing cache falls back to live
+      # detection), so a rejected push -- e.g. a branch-protected default branch
+      # that does not allow the bot to push -- must not fail the gate.
       - name: Commit stack-detection cache
         if: github.event_name == 'push'
+        continue-on-error: true
         uses: stefanzweifel/git-auto-commit-action@4a55954c782fc1ea30b9056cd3e7a2b40ca8887d  # v7.2.0
         with:
           commit_message: "chore(pr-gate): update stack-detection cache [skip ci]"
