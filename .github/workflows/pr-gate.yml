@@ -665,6 +665,7 @@ jobs:
           reviewdog_version: v0.21.2
 
       - name: Post inline PR comments
+        continue-on-error: true   # a failure to publish annotations is not a finding
         if: github.event_name == 'pull_request'
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -718,6 +719,7 @@ jobs:
           reviewdog_version: v0.21.2
 
       - name: Post inline PR comments
+        continue-on-error: true   # a failure to publish annotations is not a finding
         if: github.event_name == 'pull_request'
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -809,6 +811,7 @@ jobs:
           reviewdog_version: v0.21.2
 
       - name: Post inline PR comments
+        continue-on-error: true   # a failure to publish annotations is not a finding
         if: github.event_name == 'pull_request' && steps.scan.outcome == 'success'
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
